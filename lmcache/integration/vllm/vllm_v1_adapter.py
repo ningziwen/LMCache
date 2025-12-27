@@ -412,11 +412,17 @@ class ReqMeta:
                 block_size,
             )
 
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
+        # Calculate the number of blocks needed for token_ids
+        num_blocks_needed = cdiv(len(token_ids), block_size)
+        # Use the minimum of blocks needed and blocks allocated
+        num_blocks_to_use = min(num_blocks_needed, len(tracker.allocated_block_ids))
+        block_ids_needed = tracker.allocated_block_ids[:num_blocks_to_use]
+        
+        block_ids = torch.tensor(block_ids_needed, dtype=torch.long)
         block_offsets = torch.arange(0, block_size, dtype=torch.long)
         slot_mapping = (
             block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
+            + block_ids.reshape((num_blocks_to_use, 1)) * block_size
         )
 
         slot_mapping = slot_mapping.flatten()[: len(token_ids)]

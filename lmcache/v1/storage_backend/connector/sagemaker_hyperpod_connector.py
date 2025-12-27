@@ -3,9 +3,12 @@
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from multiprocessing import shared_memory
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, AsyncIterator, List, Optional, Tuple
 import asyncio
 import json
+import mmap
+import os
+import threading
 import time
 import urllib.parse
 
@@ -17,11 +20,13 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryObj, MemoryObjMetadata, TensorMemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.job_executor.pq_executor import AsyncPQExecutor
-from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+
+if TYPE_CHECKING:
+    from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 logger = init_logger(__name__)
 
@@ -42,6 +47,171 @@ class Priorities(IntEnum):
     LEASE = 0  # Highest priority - lease acquisition/release
     PREFETCH = auto()  # Medium priority - prefetching data
     PUT = auto()  # Lower priority - storing data
+
+
+class LeaseManager:
+    """Manages lease lifecycle for zero-copy tensors."""
+    
+    def __init__(self, connector: "SageMakerHyperPodConnector"):
+        self.connector = connector
+        self.active_leases: dict[int, tuple[CacheEngineKey, str, int, bool]] = {}
+        self.lock = threading.Lock()
+        self._cleanup_registered = False
+        self._register_cleanup_handlers()
+    
+    def _register_cleanup_handlers(self):
+        """Register cleanup handlers for process termination."""
+        if self._cleanup_registered:
+            return
+        
+        import atexit
+        import signal
+        
+        def cleanup_handler(signum=None, frame=None):
+            """Emergency cleanup of all CUDA registrations."""
+            logger.info("LeaseManager cleanup handler triggered")
+            self.cleanup_all_leases()
+        
+        # Register atexit handler
+        atexit.register(cleanup_handler)
+        
+        # Register signal handlers for graceful shutdown
+        try:
+            signal.signal(signal.SIGTERM, cleanup_handler)
+            signal.signal(signal.SIGINT, cleanup_handler)
+        except (ValueError, OSError) as e:
+            # Signal handlers can only be registered in main thread
+            logger.debug(f"Could not register signal handlers: {e}")
+        
+        self._cleanup_registered = True
+        logger.debug("Cleanup handlers registered for LeaseManager")
+    
+    def cleanup_all_leases(self):
+        """Emergency cleanup of all active leases and CUDA registrations."""
+        with self.lock:
+            if not self.active_leases:
+                return
+            
+            logger.warning(f"Emergency cleanup: releasing {len(self.active_leases)} active leases")
+            
+            for tensor_ptr, (key, lease_id, data_length, cuda_registered) in list(self.active_leases.items()):
+                if cuda_registered:
+                    try:
+                        torch.cuda.synchronize()
+                        err = torch.cuda.cudart().cudaHostUnregister(tensor_ptr)
+                        if err == 0:
+                            logger.debug(f"Emergency unregistered CUDA memory at {tensor_ptr:#x}")
+                    except Exception as e:
+                        logger.debug(f"Failed to unregister CUDA memory at {tensor_ptr:#x}: {e}")
+                
+                # Don't try to release HTTP lease during emergency cleanup
+                # as the event loop might be shutting down
+            
+            self.active_leases.clear()
+            logger.info("Emergency cleanup completed")
+    
+    def register_lease(self, tensor_ptr: int, key: CacheEngineKey, lease_id: str, data_length: int, cuda_registered: bool):
+        """Register a lease for a tensor's memory address."""
+        with self.lock:
+            self.active_leases[tensor_ptr] = (key, lease_id, data_length, cuda_registered)
+            logger.debug(f"Registered lease {lease_id} for tensor at {tensor_ptr:#x}, cuda_registered={cuda_registered}, total_active={len(self.active_leases)}")
+    
+    def release_lease(self, tensor_ptr: int):
+        """Release a lease when tensor is freed."""
+        with self.lock:
+            if tensor_ptr in self.active_leases:
+                key, lease_id, data_length, cuda_registered = self.active_leases.pop(tensor_ptr)
+                
+                # Unregister CUDA memory if it was registered
+                if cuda_registered:
+                    try:
+                        torch.cuda.synchronize()
+                        err = torch.cuda.cudart().cudaHostUnregister(tensor_ptr)
+                        if err != 0:
+                            error_str = torch.cuda.cudart().cudaGetErrorString(err)[1]
+                            logger.warning(
+                                f"cudaHostUnregister failed with error {err}: {error_str} "
+                                f"for tensor at {tensor_ptr:#x}"
+                            )
+                        else:
+                            logger.debug(
+                                f"✓ CUDA unregistration successful: {data_length} bytes "
+                                f"freed from GPU memory tracking, remaining_leases={len(self.active_leases)}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to unregister CUDA memory at {tensor_ptr:#x}: {e}")
+                
+                # Schedule async HTTP lease release
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.connector._release_lease(key, lease_id),
+                        self.connector.loop
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to schedule lease release for {lease_id}: {e}")
+                
+                logger.debug(f"Released lease {lease_id} for tensor at {tensor_ptr:#x}")
+            else:
+                logger.debug(f"Lease for tensor at {tensor_ptr:#x} already released or not found")
+
+
+class LeasedTensorMemoryObj(TensorMemoryObj):
+    """TensorMemoryObj that releases lease when freed."""
+    
+    def __init__(
+        self,
+        raw_data: torch.Tensor,
+        metadata: MemoryObjMetadata,
+        lease_manager: LeaseManager,
+        tensor_ptr: int,
+    ):
+        super().__init__(raw_data, metadata, parent_allocator=None)
+        self.lease_manager = lease_manager
+        self.tensor_ptr = tensor_ptr
+        self._lease_released = False
+        logger.debug(f"Created LeasedTensorMemoryObj at {tensor_ptr:#x}, ref_count={metadata.ref_count}")
+    
+    def ref_count_down(self):
+        """Override to release lease when ref count reaches 0."""
+        with self.lock:
+            self.meta.ref_count -= 1
+            logger.debug(
+                f"ref_count_down called for tensor at {self.tensor_ptr:#x}, "
+                f"new ref_count={self.meta.ref_count}, pin_count={self.meta.pin_count}"
+            )
+            if self.meta.ref_count < 0:
+                logger.warning(
+                    f"Ref count of MemoryObj {self.meta.address}"
+                    f"is negative: {self.meta.ref_count}."
+                    "Double free occurred somewhere."
+                    "Setting ref count back to 0 as a hack but please find the bug."
+                )
+                self.meta.ref_count = 0
+            if self.meta.ref_count == 0 and self.meta.pin_count == 0:
+                # Release the lease when memory is freed
+                self._release_lease_internal()
+    
+    def _release_lease_internal(self):
+        """Internal method to release lease, can be called from __del__ too."""
+        if not self._lease_released:
+            self._lease_released = True
+            logger.debug(f"Releasing lease for tensor at {self.tensor_ptr:#x}")
+            self.lease_manager.release_lease(self.tensor_ptr)
+    
+    def __del__(self):
+        """Fallback cleanup when object is garbage collected."""
+        # This is a safety net in case ref_count_down is never called
+        # or ref_count never reaches 0 due to circular references
+        if not self._lease_released:
+            logger.warning(
+                f"LeasedTensorMemoryObj at {self.tensor_ptr:#x} collected by GC "
+                f"without proper cleanup (ref_count={self.meta.ref_count}). "
+                f"Forcing lease release."
+            )
+            try:
+                self._release_lease_internal()
+            except Exception as e:
+                logger.error(f"Failed to release lease in __del__: {e}")
 
 
 @dataclass
@@ -73,7 +243,7 @@ class SageMakerHyperPodConnector(RemoteConnector):
         self,
         sagemaker_hyperpod_url: str,
         loop: asyncio.AbstractEventLoop,
-        local_cpu_backend: LocalCPUBackend,
+        local_cpu_backend: Optional["LocalCPUBackend"],
         bucket_name: str,
         shared_memory_name: Optional[str],
         max_concurrent_requests: int,
@@ -91,7 +261,7 @@ class SageMakerHyperPodConnector(RemoteConnector):
         Args:
             sagemaker_hyperpod_url: Base URL of the ai-toolkit daemon
             loop: Event loop for async operations
-            local_cpu_backend: Backend for local memory allocation
+            local_cpu_backend: DEPRECATED - no longer used (zero-copy only)
             bucket_name: Bucket name for KV storage namespace
             shared_memory_name: Name of shared memory segment
             (if None, shared memory disabled)
@@ -109,7 +279,7 @@ class SageMakerHyperPodConnector(RemoteConnector):
         # Core configuration
         self.base_url = sagemaker_hyperpod_url.rstrip("/")
         self.loop = loop
-        self.local_cpu_backend = local_cpu_backend
+        # local_cpu_backend is deprecated - connector now uses zero-copy only
         self.bucket_name = bucket_name
         self.shared_memory_name = shared_memory_name
         self.lease_ttl_s = lease_ttl_s
@@ -137,6 +307,12 @@ class SageMakerHyperPodConnector(RemoteConnector):
         self.shared_memory_obj: Optional[shared_memory.SharedMemory] = None
         self.shared_memory_map: Optional[memoryview] = None
 
+        # Lease management for zero-copy tensors
+        self.lease_manager = LeaseManager(self)
+        
+        # Start periodic leak monitoring
+        self._start_leak_monitor()
+
         # Observability
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -161,18 +337,80 @@ class SageMakerHyperPodConnector(RemoteConnector):
         """Initialize shared memory connection after construction."""
         if self.shared_memory_name:
             self._init_shared_memory()
+        self._start_leak_monitor()
+    
+    def _start_leak_monitor(self):
+        """Start periodic monitoring of lease leaks."""
+        def monitor_leaks():
+            while True:
+                time.sleep(300)  # Check every 5 minutes
+                with self.lease_manager.lock:
+                    num_active = len(self.lease_manager.active_leases)
+                    if num_active > 100:
+                        logger.warning(
+                            f"Potential lease leak detected: {num_active} active leases. "
+                            f"This may indicate memory objects are not being freed properly."
+                        )
+                        # Log details of oldest leases
+                        lease_items = list(self.lease_manager.active_leases.items())[:5]
+                        for tensor_ptr, (key, lease_id, data_length, cuda_registered) in lease_items:
+                            logger.warning(
+                                f"  Lease {lease_id}: tensor={tensor_ptr:#x}, "
+                                f"size={data_length/1024/1024:.2f}MB, cuda_registered={cuda_registered}"
+                            )
+        
+        monitor_thread = threading.Thread(target=monitor_leaks, daemon=True, name="LeaseMonitor")
+        monitor_thread.start()
+        logger.debug("Started lease leak monitor thread")
 
     def _init_shared_memory(self):
         """Initialize shared memory connection to ai-toolkit daemon."""
         try:
-            self.shared_memory_obj = shared_memory.SharedMemory(
-                name=self.shared_memory_name, create=False
-            )
-            self.shared_memory_map = memoryview(self.shared_memory_obj.buf)
-            size_mb = len(self.shared_memory_map) / (1024**2)
-            logger.info(
-                f"Shared memory opened: {self.shared_memory_name} ({size_mb:.2f} MB)"
-            )
+            # Try POSIX shared memory first
+            try:
+                self.shared_memory_obj = shared_memory.SharedMemory(
+                    name=self.shared_memory_name, create=False
+                )
+                
+                # CRITICAL: Unregister from resource_tracker to prevent cleanup
+                # This shared memory is owned by ai-toolkit daemon, not by us.
+                # Without this, Python's resource_tracker will delete the file
+                # when this process exits, breaking other pods on the same node.
+                from multiprocessing import resource_tracker
+                resource_tracker.unregister(
+                    self.shared_memory_obj._name, "shared_memory"
+                )
+                
+                self.shared_memory_map = memoryview(self.shared_memory_obj.buf)
+                size_mb = len(self.shared_memory_map) / (1024**2)
+                logger.info(
+                    f"Shared memory opened (POSIX): {self.shared_memory_name} "
+                    f"({size_mb:.2f} MB)"
+                )
+                return
+            except FileNotFoundError:
+                # Fall back to file-based shared memory
+                shm_path = f"/dev/shm/{self.shared_memory_name}"
+                if not os.path.exists(shm_path):
+                    raise FileNotFoundError(
+                        f"Shared memory file '{shm_path}' not found. "
+                        "Ensure ai-toolkit daemon is running."
+                    )
+                
+                # Open file and create memory map
+                fd = os.open(shm_path, os.O_RDONLY)
+                file_size = os.fstat(fd).st_size
+                self.shared_memory_obj = mmap.mmap(
+                    fd, file_size, mmap.MAP_SHARED, mmap.PROT_READ
+                )
+                os.close(fd)  # Can close fd after mmap
+                self.shared_memory_map = memoryview(self.shared_memory_obj)
+                size_mb = len(self.shared_memory_map) / (1024**2)
+                logger.info(
+                    f"Shared memory opened (file-based): {shm_path} "
+                    f"({size_mb:.2f} MB)"
+                )
+                
         except FileNotFoundError:
             logger.error(
                 f"Shared memory segment '{self.shared_memory_name}' not found. "
@@ -425,6 +663,9 @@ class SageMakerHyperPodConnector(RemoteConnector):
         Data format: [RemoteMetadata header (28 bytes)] + [KV cache payload]
         Data may be fragmented across multiple blocks in shared memory.
 
+        For zero-copy mode: Returns MemoryObj pointing directly to shared memory
+        For staging mode: Copies data to local CPU backend
+
         Args:
             key: The cache key being read
             lease_info: Lease information with memory offsets
@@ -479,35 +720,125 @@ class SageMakerHyperPodConnector(RemoteConnector):
             # Restore original shape (remove padding zeros)
             actual_shape = self._parse_shape(metadata.shape)
 
-            # Allocate local CPU memory
-            memory_obj = self.local_cpu_backend.allocate(
-                actual_shape,
-                metadata.dtype,
-                metadata.fmt,
-            )
-            if memory_obj is None:
-                logger.error(f"Failed to allocate memory for key {key.to_string()}")
-                return None
-
-            # Get writable view
-            view = self._get_writable_view(memory_obj.byte_array)
-
-            # Copy payload data from shared memory (skip header)
-            copied = self._copy_bytes_from_offsets(
-                lease_info.offsets, METADATA_SIZE_BYTES, metadata.length, view
-            )
-
-            if copied != metadata.length:
-                logger.error(
-                    f"Data size mismatch: expected {metadata.length}, got {copied}"
+            # Check if data is fragmented
+            if len(lease_info.offsets) != 1:
+                logger.warning(
+                    f"Data is fragmented across {len(lease_info.offsets)} blocks. "
+                    f"Zero-copy not possible, will copy to contiguous buffer. key={key.to_string()}"
                 )
-                memory_obj.ref_count_down()
-                return None
+                # Allocate contiguous buffer for fragmented data
+                buffer = bytearray(metadata.length)
+                copied = self._copy_bytes_from_offsets(
+                    lease_info.offsets, METADATA_SIZE_BYTES, metadata.length, memoryview(buffer)
+                )
+                if copied != metadata.length:
+                    logger.error(
+                        f"Data size mismatch: expected {metadata.length}, got {copied}"
+                    )
+                    return None
+                
+                # Create tensor from copied buffer
+                tensor = torch.frombuffer(
+                    buffer,
+                    dtype=metadata.dtype,
+                    count=metadata.length // metadata.dtype.itemsize
+                ).reshape(actual_shape).clone()  # Clone to own the memory
+                
+                # Standard TensorMemoryObj (not leased since we copied)
+                mem_metadata = MemoryObjMetadata(
+                    shape=actual_shape,
+                    dtype=metadata.dtype,
+                    address=tensor.data_ptr(),
+                    phy_size=metadata.length,
+                    ref_count=1,
+                    pin_count=0,
+                    fmt=metadata.fmt,
+                    shapes=[actual_shape],
+                    dtypes=[metadata.dtype],
+                )
+                memory_obj = TensorMemoryObj(raw_data=tensor, metadata=mem_metadata, parent_allocator=None)
+                
+                logger.debug(
+                    f"Read from shared memory (copied): key={key.to_string()}, "
+                    f"shape={actual_shape}, dtype={metadata.dtype}, "
+                    f"size={metadata.length} bytes"
+                )
+                return memory_obj
+
+            # Zero-copy path: use data directly from shared memory (contiguous only)
+            offset, length = lease_info.offsets[0]
+            data_offset = offset + METADATA_SIZE_BYTES
+            data_length = metadata.length
+
+            # Create torch tensor from shared memory buffer (zero-copy)
+            # The tensor wraps the shared memory without copying
+            data_ptr = self.shared_memory_map[data_offset : data_offset + data_length]
+            
+            # Convert memoryview to torch tensor
+            # frombuffer creates a tensor that shares memory with the buffer
+            tensor = torch.frombuffer(
+                data_ptr,
+                dtype=metadata.dtype,
+                count=data_length // metadata.dtype.itemsize
+            ).reshape(actual_shape)
+            
+            # Register with CUDA for direct GPU access (zero-copy to GPU)
+            cuda_registered = False
+            try:
+                if torch.cuda.is_available():
+                    logger.debug(
+                        f"Attempting CUDA registration for {data_length} bytes "
+                        f"at address {tensor.data_ptr():#x}"
+                    )
+                    # Get the data pointer and register with CUDA
+                    ptr = tensor.data_ptr()
+                    err = torch.cuda.cudart().cudaHostRegister(ptr, data_length, 0)
+                    if err != 0:
+                        error_str = torch.cuda.cudart().cudaGetErrorString(err)[1]
+                        logger.warning(
+                            f"cudaHostRegister failed with error {err}: {error_str}. "
+                            f"GPU access will use staging copy."
+                        )
+                    else:
+                        cuda_registered = True
+                        logger.debug(
+                            f"✓ CUDA registration successful: {data_length} bytes "
+                            f"registered for direct GPU access"
+                        )
+                else:
+                    logger.debug("CUDA not available, skipping CUDA registration")
+            except Exception as e:
+                logger.warning(f"Failed to register with CUDA: {e}", exc_info=True)
+
+            # Create MemoryObj metadata
+            mem_metadata = MemoryObjMetadata(
+                shape=actual_shape,
+                dtype=metadata.dtype,
+                address=tensor.data_ptr(),
+                phy_size=data_length,
+                ref_count=1,
+                pin_count=0,
+                fmt=metadata.fmt,
+                shapes=[actual_shape],
+                dtypes=[metadata.dtype],
+            )
+            
+            # Create LeasedTensorMemoryObj that will release lease when freed
+            tensor_ptr = tensor.data_ptr()
+            memory_obj = LeasedTensorMemoryObj(
+                raw_data=tensor,
+                metadata=mem_metadata,
+                lease_manager=self.lease_manager,
+                tensor_ptr=tensor_ptr,
+            )
+            
+            # Register the lease so it stays alive while tensor is in use
+            self.lease_manager.register_lease(tensor_ptr, key, lease_info.lease_id, data_length, cuda_registered)
 
             logger.debug(
-                f"Read from shared memory: key={key.to_string()}, "
-                f"shape={actual_shape}, dtype={metadata.dtype},"
-                f"size={metadata.length} bytes"
+                f"Read from shared memory (zero-copy): key={key.to_string()}, "
+                f"shape={actual_shape}, dtype={metadata.dtype}, "
+                f"size={metadata.length} bytes, cuda_registered={cuda_registered}"
             )
 
             return memory_obj
@@ -715,11 +1046,9 @@ class SageMakerHyperPodConnector(RemoteConnector):
         except Exception as e:
             self.stats["get_failure"] += 1
             logger.error(f"GET error: key={key.to_string()} - {e}")
-            return None
-
-        finally:
-            # Always release lease immediately after read
+            # Release lease on error
             await self._release_lease(key, lease_info.lease_id)
+            return None
 
     async def batched_get(
         self, keys: List[CacheEngineKey]
@@ -979,7 +1308,11 @@ class SageMakerHyperPodConnector(RemoteConnector):
 
         if self.shared_memory_obj is not None:
             try:
-                self.shared_memory_obj.close()
+                # Handle both mmap and SharedMemory objects
+                if isinstance(self.shared_memory_obj, mmap.mmap):
+                    self.shared_memory_obj.close()
+                else:
+                    self.shared_memory_obj.close()
             except Exception as e:
                 logger.warning(f"Error closing shared memory object: {e}")
             self.shared_memory_obj = None

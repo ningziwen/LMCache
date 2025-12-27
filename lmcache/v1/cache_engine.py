@@ -716,6 +716,12 @@ class LMCacheEngine:
             self.gpu_connector.batched_to_gpu(
                 list(memory_objs), list(starts), list(ends), **kwargs
             )
+            
+            # Ensure all GPU operations complete before releasing references
+            # This prevents race conditions where CUDA might still be using
+            # the tensor data when we call ref_count_down()
+            if hasattr(torch.cuda, 'synchronize'):
+                torch.cuda.synchronize()
 
         # TODO(Jiayi): Remove the following for loop with batched operations
         # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
@@ -723,6 +729,12 @@ class LMCacheEngine:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
                 self.storage_manager.remove(key)
+            
+            # Explicitly clear any cached tensor views to help GC
+            # This breaks potential circular references
+            if hasattr(memory_obj, '_cached_tensor'):
+                delattr(memory_obj, '_cached_tensor')
+            
             memory_obj.ref_count_down()
 
         onload_time = time.perf_counter() - t
