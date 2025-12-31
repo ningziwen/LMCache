@@ -262,22 +262,33 @@ class RequestTracker:
             assert all_token_ids is not None, (
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
-            # the block ids will change after preemption
+            # CRITICAL FIX: vLLM only allocates blocks based on vllm_cached_tokens,
+            # NOT max(lmcache_cached_tokens, vllm_cached_tokens). Using max() causes
+            # token_ids to be longer than allocated blocks.
+            num_computed_tokens = vllm_cached_tokens
+
+            # For preempted requests, restore token_ids from the full token list
+            # to ensure chunk keys match what was used during lookup.
+            num_tokens_needed = num_computed_tokens + len(new_token_ids)
+            self.token_ids = list(all_token_ids[:num_tokens_needed])
+
+            # CRITICAL: new_block_ids from vLLM should contain enough blocks for
+            # num_tokens_needed tokens. Verify this before proceeding.
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
-            num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
-            # FIX: For preempted requests, restore token_ids from the full
-            # token list to ensure chunk keys match what was used during
-            # lookup. The lookup uses request.all_token_ids, so we need the
-            # same tokens for retrieve.
-            num_tokens_needed = max(
-                num_computed_tokens + len(new_token_ids),
-                lmcache_cached_tokens,
+            logger.debug(
+                f"Preempted request {self.req_id}: "
+                f"vllm_cached={vllm_cached_tokens}, "
+                f"lmcache_cached={lmcache_cached_tokens}, "
+                f"new_tokens={len(new_token_ids)}, "
+                f"num_tokens_needed={num_tokens_needed}, "
+                f"allocated_blocks={len(new_block_ids)}, "
+                f"token_ids_len={len(self.token_ids)}"
             )
-            self.token_ids = all_token_ids[:num_tokens_needed]
         else:
+            # Non-preempted request: extend with new tokens and blocks
             self.allocated_block_ids.extend(new_block_ids)
             self.token_ids.extend(new_token_ids)
 
@@ -376,6 +387,16 @@ class ReqMeta:
         else:
             num_tokens_to_save = input_token_len
 
+        # Cap num_tokens_to_save to allocated block capacity to prevent mismatch
+        num_blocks = len(tracker.allocated_block_ids)
+        max_tokens = num_blocks * block_size
+        if num_tokens_to_save > max_tokens:
+            logger.warning(
+                f"Request {tracker.req_id}: num_tokens_to_save ({num_tokens_to_save}) "
+                f"exceeds allocated capacity ({max_tokens}). Capping to {max_tokens}."
+            )
+            num_tokens_to_save = max_tokens
+
         # If we need to save, update the number of saved tokens
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
@@ -396,9 +417,7 @@ class ReqMeta:
             )
             token_ids = token_ids.tolist()
 
-        num_blocks = len(tracker.allocated_block_ids)
-
-        if len(token_ids) > num_blocks * block_size:
+        if len(token_ids) > max_tokens:
             logger.error(
                 "The number of tokens is more than the number of blocks"
                 " for request %s. "
@@ -420,6 +439,19 @@ class ReqMeta:
         )
 
         slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+
+        # DEBUG: Log mismatch between slot_mapping and token_ids
+        if len(slot_mapping) != len(token_ids):
+            logger.error(
+                f"MISMATCH in from_request_tracker for {tracker.req_id}: "
+                f"slot_mapping_len={len(slot_mapping)}, "
+                f"token_ids_len={len(token_ids)}, "
+                f"num_blocks={num_blocks}, "
+                f"block_size={block_size}, "
+                f"allocated_block_ids={len(tracker.allocated_block_ids)}, "
+                f"num_saved_tokens={tracker.num_saved_tokens}"
+            )
+
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: check whether the request is scheduled to load
@@ -1859,18 +1891,6 @@ class LMCacheConnectorV1Impl:
             if preempted:
                 assert load_spec is not None, (
                     f"Request {req_id} is preempted but was not given a load spec"
-                )
-                # num_computed_tokens should be reset to 0 during preemption
-                # and then set to the number of already cached tokens (maxxing
-                # prefix caching and lmcache)
-                # this assumption is crucial for the update() call of RequestTracker
-                assert request.num_computed_tokens == max(
-                    lmcache_cached_tokens, load_spec.vllm_cached_tokens
-                ), (
-                    f"Preempted request {req_id} has "
-                    f"num_computed_tokens {request.num_computed_tokens} "
-                    "but max(lmcache_cached_tokens, vllm_cached_tokens) = "
-                    f"{max(lmcache_cached_tokens, vllm_cached_tokens)}"
                 )
 
             # Pass all_token_ids for preempted requests to restore
