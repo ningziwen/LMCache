@@ -219,7 +219,6 @@ class PDBackend(AllocatorBackendInterface):
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
     ) -> PagedCpuGpuMemoryAllocator:
-        # First Party
 
         if self.corrected_device != "cpu":
             logger.info(f"Setting cuda device to {self.corrected_device} ")

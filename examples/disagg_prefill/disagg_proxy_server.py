@@ -125,6 +125,22 @@ async def lifespan(app: FastAPI):
 
     app.state.zmq_task = asyncio.create_task(zmq_pull_server())
 
+    # Decode admission control
+    if global_args.max_concurrent_decodes > 0:
+        app.state.decode_semaphore = asyncio.Semaphore(
+            global_args.max_concurrent_decodes
+        )
+        logger.info(
+            "Decode admission control enabled, "
+            "max_concurrent_decodes=%d", global_args.max_concurrent_decodes
+        )
+    else:
+        app.state.decode_semaphore = None
+
+    # Metrics for admission control observability
+    app.state.active_decodes = 0
+    app.state.decode_queue_waits = 0
+
     yield
 
     # Shutdown: Close clients
@@ -198,6 +214,15 @@ def parse_args():
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--proxy-host", type=str, default="localhost")
     parser.add_argument("--proxy-port", type=int, default=8500)
+    parser.add_argument(
+        "--max-concurrent-decodes",
+        type=int,
+        default=0,
+        help="Maximum number of concurrent decode requests forwarded to the decoder. "
+        "When a prefill completes but the decoder is at capacity, the request waits "
+        "until a decode slot opens. 0 means unlimited (default). "
+        "Recommended: match decoder's max_num_seqs (e.g., 256).",
+    )
 
     args = parser.parse_args()
     return args
@@ -430,10 +455,23 @@ async def handle_completions(request: Request):
             # Wait until decode node signals that kv is ready
             await wait_decode_kv_ready(req_id, num_tp_rank)
 
-            async for chunk in stream_service_response(
-                decode_client.client, "/v1/completions", req_data
-            ):
-                yield chunk
+            # Acquire decode admission semaphore before streaming
+            semaphore = app.state.decode_semaphore
+            if semaphore is not None:
+                app.state.decode_queue_waits += 1
+                await semaphore.acquire()
+                app.state.decode_queue_waits -= 1
+                app.state.active_decodes += 1
+
+            try:
+                async for chunk in stream_service_response(
+                    decode_client.client, "/v1/completions", req_data
+                ):
+                    yield chunk
+            finally:
+                if semaphore is not None:
+                    app.state.active_decodes -= 1
+                    semaphore.release()
 
         return StreamingResponse(generate_stream(), media_type="application/json")
 
@@ -556,52 +594,65 @@ async def handle_chat_completions(request: Request):
 
             await wait_decode_kv_ready(req_id, num_tp_rank)
 
-            # Stream and convert completion format chunks to chat completion format
-            async for chunk in stream_service_response(
-                decode_client.client, "/v1/completions", req_data
-            ):
-                chunk_str = chunk.decode("utf-8")
-                if chunk_str.startswith("data: ") and not chunk_str.startswith(
-                    "data: [DONE]"
+            # Acquire decode admission semaphore before streaming
+            semaphore = app.state.decode_semaphore
+            if semaphore is not None:
+                app.state.decode_queue_waits += 1
+                await semaphore.acquire()
+                app.state.decode_queue_waits -= 1
+                app.state.active_decodes += 1
+
+            try:
+                # Stream and convert completion format chunks to chat completion format
+                async for chunk in stream_service_response(
+                    decode_client.client, "/v1/completions", req_data
                 ):
-                    try:
-                        json_str = chunk_str[6:].strip()  # Remove 'data: ' prefix
-                        if json_str:
-                            completion_data = json.loads(json_str)
-                            chat_completion_data = {
-                                "id": completion_data["id"],
-                                "object": "chat.completion.chunk",
-                                "created": completion_data["created"],
-                                "model": completion_data["model"],
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {
-                                            "content": completion_data["choices"][0][
-                                                "text"
-                                            ]
-                                        },
-                                        "logprobs": completion_data["choices"][0].get(
-                                            "logprobs"
-                                        ),
-                                        "finish_reason": completion_data["choices"][
-                                            0
-                                        ].get("finish_reason"),
-                                    }
-                                ],
-                            }
-                            converted_chunk = (
-                                "data: "
-                                + json.dumps(
-                                    chat_completion_data, separators=(",", ":")
-                                )
-                                + "\n\n"
-                            ).encode()
-                            yield converted_chunk
-                    except (json.JSONDecodeError, KeyError):
+                    chunk_str = chunk.decode("utf-8")
+                    if chunk_str.startswith("data: ") and not chunk_str.startswith(
+                        "data: [DONE]"
+                    ):
+                        try:
+                            json_str = chunk_str[6:].strip()  # Remove 'data: ' prefix
+                            if json_str:
+                                completion_data = json.loads(json_str)
+                                chat_completion_data = {
+                                    "id": completion_data["id"],
+                                    "object": "chat.completion.chunk",
+                                    "created": completion_data["created"],
+                                    "model": completion_data["model"],
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "content": completion_data["choices"][0][
+                                                    "text"
+                                                ]
+                                            },
+                                            "logprobs": completion_data["choices"][0].get(
+                                                "logprobs"
+                                            ),
+                                            "finish_reason": completion_data["choices"][
+                                                0
+                                            ].get("finish_reason"),
+                                        }
+                                    ],
+                                }
+                                converted_chunk = (
+                                    "data: "
+                                    + json.dumps(
+                                        chat_completion_data, separators=(",", ":")
+                                    )
+                                    + "\n\n"
+                                ).encode()
+                                yield converted_chunk
+                        except (json.JSONDecodeError, KeyError):
+                            yield chunk
+                    else:
                         yield chunk
-                else:
-                    yield chunk
+            finally:
+                if semaphore is not None:
+                    app.state.active_decodes -= 1
+                    semaphore.release()
 
         return StreamingResponse(generate_stream(), media_type="application/json")
 
@@ -617,6 +668,20 @@ async def handle_chat_completions(request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+
+
+@app.get("/v1/admission_status")
+async def admission_status():
+    """Observability endpoint for decode admission control."""
+    semaphore = app.state.decode_semaphore
+    if semaphore is None:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "max_concurrent_decodes": global_args.max_concurrent_decodes,
+        "active_decodes": app.state.active_decodes,
+        "queued_waiting": app.state.decode_queue_waits,
+    }
 
 
 if __name__ == "__main__":
