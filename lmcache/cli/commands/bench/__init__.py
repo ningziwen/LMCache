@@ -96,8 +96,10 @@ class BenchCommand(BaseCommand):
             "--workload",
             default=None,
             choices=[
+                "growing-conversation",
                 "long-doc-permutator",
                 "long-doc-qa",
+                "mixed",
                 "multi-round-chat",
                 "random-prefill",
             ],
@@ -147,6 +149,29 @@ class BenchCommand(BaseCommand):
             action="store_true",
             help=(
                 "Disable interactive mode. Errors if required arguments are missing."
+            ),
+        )
+        parser.add_argument(
+            "--extra-headers",
+            default=None,
+            help='JSON dict of extra HTTP headers (e.g., \'{"x-api-key": "abc"}\').',
+        )
+        parser.add_argument(
+            "--session-key",
+            default=None,
+            help=(
+                "Header name for session-based routing. When set, each "
+                "concurrent user sends a unique session ID via this header "
+                "(e.g., --session-key x-session-id)."
+            ),
+        )
+        parser.add_argument(
+            "--raw-sse",
+            action="store_true",
+            help=(
+                "Use raw HTTP streaming instead of the OpenAI client. "
+                "Required for DPD routers that return mixed SSE formats "
+                "(text_completion + completion chunks)."
             ),
         )
         parser.add_argument(
@@ -277,6 +302,84 @@ class BenchCommand(BaseCommand):
             type=int,
             default=50,
             help="Number of requests to send (default: 50).",
+        )
+        rp_group.add_argument(
+            "--rp-output-length",
+            type=int,
+            default=200,
+            help="Max tokens to generate per response (default: 200).",
+        )
+        rp_group.add_argument(
+            "--rp-qps",
+            type=float,
+            default=4.0,
+            help="Queries per second (default: 4.0).",
+        )
+
+        # --- Mixed workload args ---
+        mx_group = parser.add_argument_group("mixed workload options")
+        mx_group.add_argument(
+            "--mx-shared-prompt-length", type=int, default=2000,
+            help="System prompt token length for chat sessions (default: 2000).",
+        )
+        mx_group.add_argument(
+            "--mx-chat-history-length", type=int, default=10000,
+            help="Pre-filled chat history token length (default: 10000).",
+        )
+        mx_group.add_argument(
+            "--mx-unique-prompt-length", type=int, default=12000,
+            help="Token length of unique random prompts (default: 12000).",
+        )
+        mx_group.add_argument(
+            "--mx-user-input-length", type=int, default=50,
+            help="Tokens per user query in chat sessions (default: 50).",
+        )
+        mx_group.add_argument(
+            "--mx-output-length", type=int, default=200,
+            help="Max tokens to generate per response (default: 200).",
+        )
+        mx_group.add_argument(
+            "--mx-qps", type=float, default=6.0,
+            help="Queries per second (default: 6.0).",
+        )
+        mx_group.add_argument(
+            "--mx-duration", type=float, default=180.0,
+            help="Benchmark duration in seconds (default: 180).",
+        )
+        mx_group.add_argument(
+            "--mx-num-chat-sessions", type=int, default=25,
+            help="Number of multi-round chat sessions (default: 25).",
+        )
+        mx_group.add_argument(
+            "--mx-unique-ratio", type=float, default=0.5,
+            help="Fraction of requests that are unique prompts (default: 0.5).",
+        )
+
+        # --- Growing-conversation workload args ---
+        gc_group = parser.add_argument_group("growing-conversation workload options")
+        gc_group.add_argument(
+            "--gc-num-conversations", type=int, default=60,
+            help="Number of concurrent conversations (default: 60).",
+        )
+        gc_group.add_argument(
+            "--gc-num-rounds", type=int, default=10,
+            help="Number of rounds per conversation (default: 10).",
+        )
+        gc_group.add_argument(
+            "--gc-system-prompt-length", type=int, default=500,
+            help="System prompt token length (default: 500).",
+        )
+        gc_group.add_argument(
+            "--gc-user-message-length", type=int, default=500,
+            help="User message token length per round (default: 500).",
+        )
+        gc_group.add_argument(
+            "--gc-output-length", type=int, default=200,
+            help="Max tokens to generate per response (default: 200).",
+        )
+        gc_group.add_argument(
+            "--gc-qps", type=float, default=4.0,
+            help="Queries per second (default: 4.0).",
         )
 
         parser.set_defaults(func=self.execute)
@@ -435,7 +538,12 @@ class BenchCommand(BaseCommand):
         )
 
         # 3. Create request sender (callbacks wired after workload creation)
-        request_sender = RequestSender(config.engine_url, config.model)
+        request_sender = RequestSender(
+            config.engine_url,
+            config.model,
+            extra_headers=config.extra_headers,
+            raw_sse=config.raw_sse,
+        )
 
         # 4. Create workload
         workload = create_workload(
@@ -465,7 +573,10 @@ class BenchCommand(BaseCommand):
             workload.run()
         finally:
             progress_monitor.stop()
-            asyncio.run(request_sender.close())
+            try:
+                asyncio.run(request_sender.close())
+            except RuntimeError:
+                pass  # Event loop already closed
 
         # 7. Final metrics
         final = stats_collector.get_final_stats()
@@ -553,5 +664,11 @@ class BenchCommand(BaseCommand):
             "P99 decode (tok/s)",
             round(final.p99_decode_speed, 2),
         )
+
+        itl = metrics.add_section("itl", "Inter-Token Latency")
+        itl.add("mean", "Mean ITL (ms)", round(final.mean_itl_ms, 2))
+        itl.add("p50", "P50 ITL (ms)", round(final.p50_itl_ms, 2))
+        itl.add("p90", "P90 ITL (ms)", round(final.p90_itl_ms, 2))
+        itl.add("p99", "P99 ITL (ms)", round(final.p99_itl_ms, 2))
 
         metrics.emit()

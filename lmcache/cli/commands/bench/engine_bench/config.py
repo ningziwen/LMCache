@@ -39,6 +39,9 @@ class EngineBenchConfig:
     export_csv: bool
     export_json: bool
     quiet: bool
+    extra_headers: dict[str, str]
+    session_key: str
+    raw_sse: bool
 
     def __post_init__(self) -> None:
         if not self.engine_url:
@@ -242,4 +245,7 @@ def parse_args_to_config(args: argparse.Namespace) -> EngineBenchConfig:
         export_csv=not args.no_csv,
         export_json=args.json,
         quiet=args.quiet,
+        extra_headers=json.loads(args.extra_headers) if getattr(args, "extra_headers", None) else {},
+        session_key=getattr(args, "session_key", "") or "",
+        raw_sse=getattr(args, "raw_sse", False),
     )
