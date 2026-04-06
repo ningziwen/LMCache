@@ -23,6 +23,8 @@ class RandomPrefillConfig:
 
     request_length: int = 10000
     num_requests: int = 50
+    output_length: int = 200
+    qps: float = 4.0
 
     def __post_init__(self) -> None:
         if self.request_length <= 0:
@@ -31,21 +33,25 @@ class RandomPrefillConfig:
             )
         if self.num_requests < 1:
             raise ValueError(f"num_requests must be >= 1, got {self.num_requests}")
+        if self.output_length < 1:
+            raise ValueError(f"output_length must be >= 1, got {self.output_length}")
+        if self.qps <= 0:
+            raise ValueError(f"qps must be positive, got {self.qps}")
 
     @classmethod
     def resolve(
         cls,
         request_length: int = 10000,
         num_requests: int = 50,
+        output_length: int = 200,
+        qps: float = 4.0,
     ) -> "RandomPrefillConfig":
-        """Create a config from CLI args.
-
-        Unlike other workloads, random-prefill does not use the KV cache
-        budget to compute request count — the user specifies it directly.
-        """
+        """Create a config from CLI args."""
         return cls(
             request_length=request_length,
             num_requests=num_requests,
+            output_length=output_length,
+            qps=qps,
         )
 
 
@@ -70,7 +76,8 @@ class RandomPrefillWorkload(BaseWorkload):
         self._seed = seed
 
         self._prompts = self._generate_prompts()
-        self._dispatched = False
+        self._dispatch_index = 0
+        self._interval = 1.0 / config.qps
         self._pending_tasks: set[asyncio.Task] = set()
 
     def log_config(self) -> None:
@@ -86,7 +93,8 @@ class RandomPrefillWorkload(BaseWorkload):
             f"{B}{'─' * 50}{R}\n"
             f"  Requests:         {Y}{c.num_requests}{R}\n"
             f"  Request length:   {Y}{c.request_length}{R} tokens\n"
-            f"  Max output:       {Y}1{R} token\n"
+            f"  Output length:    {Y}{c.output_length}{R} tokens\n"
+            f"  QPS:              {Y}{c.qps}{R}\n"
             f"{B}{'═' * 50}{R}"
         )
 
@@ -120,30 +128,25 @@ class RandomPrefillWorkload(BaseWorkload):
     # ------------------------------------------------------------------
 
     async def step(self, time_offset: float) -> float:
-        """Dispatch all requests at once on the first call.
+        """Dispatch the next request at QPS-controlled rate.
 
         Returns:
-            0.0 while tasks are pending, -1.0 when all done.
+            Next wakeup time, or -1.0 when all done.
         """
-        if not self._dispatched:
-            self._dispatched = True
-            for i, prompt in enumerate(self._prompts):
-                request_id = f"prefill_{i}"
-                messages = [{"role": "user", "content": prompt}]
-                self._progress_monitor.on_request_sent(request_id)
+        if self._dispatch_index < len(self._prompts):
+            request_id = f"prefill_{self._dispatch_index}"
+            messages = [{"role": "user", "content": self._prompts[self._dispatch_index]}]
+            self._progress_monitor.on_request_sent(request_id)
 
-                task = asyncio.create_task(
-                    self._dispatch(request_id, messages),
-                )
-                self._pending_tasks.add(task)
-                task.add_done_callback(self._on_task_done)
-
-            self._progress_monitor.log_message(
-                f"Dispatched all {self._config.num_requests} requests"
+            task = asyncio.create_task(
+                self._dispatch(request_id, messages),
             )
-            return 0.0
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._on_task_done)
 
-        # Wait for pending tasks
+            self._dispatch_index += 1
+            return self._dispatch_index * self._interval
+
         if self._pending_tasks:
             await asyncio.wait(
                 self._pending_tasks,
@@ -158,11 +161,11 @@ class RandomPrefillWorkload(BaseWorkload):
         request_id: str,
         messages: list[dict[str, str]],
     ) -> None:
-        """Send a single prefill request with max_tokens=1."""
+        """Send a single request with configurable output length."""
         await self._request_sender.send_request(
             request_id,
             messages,
-            max_tokens=1,
+            max_tokens=self._config.output_length,
         )
 
     def _on_task_done(self, task: asyncio.Task) -> None:
