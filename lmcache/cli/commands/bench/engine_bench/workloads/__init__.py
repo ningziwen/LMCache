@@ -34,6 +34,14 @@ from lmcache.cli.commands.bench.engine_bench.workloads.random_prefill import (
     RandomPrefillConfig,
     RandomPrefillWorkload,
 )
+from lmcache.cli.commands.bench.engine_bench.workloads.mixed_workload import (
+    MixedWorkloadConfig,
+    MixedWorkload,
+)
+from lmcache.cli.commands.bench.engine_bench.workloads.growing_conversation import (
+    GrowingConversationConfig,
+    GrowingConversationWorkload,
+)
 
 __all__ = [
     "BaseWorkload",
@@ -49,8 +57,10 @@ __all__ = [
 ]
 
 _WORKLOAD_NAMES = (
+    "growing-conversation",
     "long-doc-permutator",
     "long-doc-qa",
+    "mixed",
     "multi-round-chat",
     "random-prefill",
 )
@@ -139,9 +149,48 @@ def create_workload(
         rp_workload_config = RandomPrefillConfig.resolve(
             request_length=args.rp_request_length,
             num_requests=args.rp_num_requests,
+            output_length=args.rp_output_length,
+            qps=args.rp_qps,
         )
         return RandomPrefillWorkload(
             config=rp_workload_config,
+            request_sender=request_sender,
+            stats_collector=stats_collector,
+            progress_monitor=progress_monitor,
+            seed=config.seed,
+        )
+
+    if config.workload == "growing-conversation":
+        gc_config = GrowingConversationConfig.resolve(
+            num_conversations=args.gc_num_conversations,
+            num_rounds=args.gc_num_rounds,
+            system_prompt_length=args.gc_system_prompt_length,
+            user_message_length=args.gc_user_message_length,
+            output_length=args.gc_output_length,
+            qps=args.gc_qps,
+        )
+        return GrowingConversationWorkload(
+            config=gc_config,
+            request_sender=request_sender,
+            stats_collector=stats_collector,
+            progress_monitor=progress_monitor,
+            seed=config.seed,
+        )
+
+    if config.workload == "mixed":
+        mx_config = MixedWorkloadConfig.resolve(
+            shared_prompt_length=args.mx_shared_prompt_length,
+            chat_history_length=args.mx_chat_history_length,
+            unique_prompt_length=args.mx_unique_prompt_length,
+            user_input_length=args.mx_user_input_length,
+            output_length=args.mx_output_length,
+            qps=args.mx_qps,
+            duration=args.mx_duration,
+            num_chat_sessions=args.mx_num_chat_sessions,
+            unique_ratio=args.mx_unique_ratio,
+        )
+        return MixedWorkload(
+            config=mx_config,
             request_sender=request_sender,
             stats_collector=stats_collector,
             progress_monitor=progress_monitor,
