@@ -475,3 +475,22 @@ class TestRequestSenderClose:
         await sender.close()
 
         mock_client.close.assert_called_once()
+
+
+# -----------------------------------------------------------------------
+# Extra headers tests
+# -----------------------------------------------------------------------
+
+
+class TestExtraHeaders:
+    def test_extra_headers_stored(self) -> None:
+        s = RequestSender(
+            "http://localhost:8000",
+            "test-model",
+            extra_headers={"x-api-key": "abc"},
+        )
+        assert s._extra_headers == {"x-api-key": "abc"}
+
+    def test_extra_headers_default_empty(self) -> None:
+        s = RequestSender("http://localhost:8000", "test-model")
+        assert s._extra_headers == {}

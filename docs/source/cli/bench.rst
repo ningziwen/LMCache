@@ -145,6 +145,11 @@ General Options
    * - ``-q`` / ``--quiet``
      - No
      - Suppress the real-time progress display.
+   * - ``--extra-headers JSON``
+     - No
+     - JSON dict of extra HTTP headers to include in every request
+       (e.g., ``'{"x-api-key": "abc"}'``). Useful for API keys,
+       tracing headers, or custom routing hints.
 
 
 .. _bench-tokens-per-gb:

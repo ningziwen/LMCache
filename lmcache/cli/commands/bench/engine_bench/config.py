@@ -20,6 +20,29 @@ logger = init_logger(__name__)
 _GB = 1024**3
 
 
+def _parse_extra_headers(raw: str | None) -> dict[str, str]:
+    """Parse ``--extra-headers`` JSON string into a ``dict[str, str]``.
+
+    Raises ``SystemExit`` if the value is not a JSON object with string
+    keys and string values.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--extra-headers: invalid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(
+            "--extra-headers: expected a JSON object (dict), "
+            f"got {type(parsed).__name__}"
+        )
+    for k, v in parsed.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise SystemExit("--extra-headers: all keys and values must be strings")
+    return parsed
+
+
 @dataclass
 class EngineBenchConfig:
     """Top-level config produced from CLI args, interactive mode, or saved config.
@@ -39,6 +62,7 @@ class EngineBenchConfig:
     export_csv: bool
     export_json: bool
     quiet: bool
+    extra_headers: dict[str, str]
 
     def __post_init__(self) -> None:
         if not self.engine_url:
@@ -242,4 +266,5 @@ def parse_args_to_config(args: argparse.Namespace) -> EngineBenchConfig:
         export_csv=not args.no_csv,
         export_json=args.json,
         quiet=args.quiet,
+        extra_headers=_parse_extra_headers(getattr(args, "extra_headers", None)),
     )

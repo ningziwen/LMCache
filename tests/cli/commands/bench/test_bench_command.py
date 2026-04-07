@@ -73,6 +73,7 @@ def _make_config(**overrides) -> EngineBenchConfig:
         export_csv=True,
         export_json=False,
         quiet=True,
+        extra_headers={},
     )
     defaults.update(overrides)
     return EngineBenchConfig(**defaults)  # type: ignore[arg-type]
@@ -115,6 +116,7 @@ def _make_result(request_id: str = "req_0") -> RequestResult:
         num_input_tokens=100,
         num_output_tokens=10,
         decode_speed=25.0,
+        inter_token_latency=0.012,
         submit_time=now,
         first_token_time=now + 0.3,
         finish_time=now + 2.0,

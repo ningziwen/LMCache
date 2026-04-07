@@ -266,7 +266,16 @@ def run_interactive(args: argparse.Namespace) -> argparse.Namespace:
 
     # Carry over output settings from original CLI args
     ns = state.to_namespace()
-    for attr in ("output_dir", "seed", "no_csv", "json", "quiet", "format", "output"):
+    for attr in (
+        "output_dir",
+        "seed",
+        "no_csv",
+        "json",
+        "quiet",
+        "format",
+        "output",
+        "extra_headers",
+    ):
         cli_val = getattr(args, attr, None)
         if cli_val is not None:
             setattr(ns, attr, cli_val)

@@ -73,10 +73,12 @@ class RequestSender:
         model: str,
         completions_mode: bool = False,
         on_finished: list[OnFinishedCallback] = [],  # noqa: B006
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self._model = model
         self._completions_mode = completions_mode
         self._on_finished = list(on_finished)
+        self._extra_headers = extra_headers or {}
 
         base_url = _normalize_url(engine_url)
         api_key = os.getenv("OPENAI_API_KEY", "")
@@ -151,6 +153,7 @@ class RequestSender:
                 num_input_tokens=num_input_tokens,
                 num_output_tokens=num_output,
                 decode_speed=decode_speed,
+                inter_token_latency=0.0,
                 submit_time=submit_time,
                 first_token_time=first_token_time,
                 finish_time=finish_time,
@@ -168,6 +171,7 @@ class RequestSender:
                 num_input_tokens=0,
                 num_output_tokens=0,
                 decode_speed=0.0,
+                inter_token_latency=0.0,
                 submit_time=submit_time,
                 first_token_time=0.0,
                 finish_time=finish_time,
@@ -212,6 +216,8 @@ class RequestSender:
         max_tokens: int,
     ) -> collections.abc.AsyncIterator:
         """Dispatch the streaming API call (chat or completions)."""
+        extra = dict(self._extra_headers)
+
         if self._completions_mode:
             prompt = messages[0]["content"] if messages else ""
             return await self._client.completions.create(
@@ -221,6 +227,7 @@ class RequestSender:
                 max_tokens=max_tokens,
                 temperature=0.0,
                 stream_options={"include_usage": True},
+                extra_headers=extra if extra else None,
             )
         return await self._client.chat.completions.create(
             model=self._model,
@@ -229,4 +236,5 @@ class RequestSender:
             max_tokens=max_tokens,
             temperature=0.0,
             stream_options={"include_usage": True},
+            extra_headers=extra if extra else None,
         )

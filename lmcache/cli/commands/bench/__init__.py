@@ -150,6 +150,11 @@ class BenchCommand(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--extra-headers",
+            default=None,
+            help='JSON dict of extra HTTP headers (e.g., \'{"x-api-key": "abc"}\').',
+        )
+        parser.add_argument(
             "--export-config",
             default=None,
             metavar="FILE",
@@ -333,6 +338,7 @@ class BenchCommand(BaseCommand):
                 "quiet",
                 "format",
                 "output",
+                "extra_headers",
             ):
                 cli_val = getattr(args, attr, None)
                 if cli_val is not None:
@@ -435,7 +441,11 @@ class BenchCommand(BaseCommand):
         )
 
         # 3. Create request sender (callbacks wired after workload creation)
-        request_sender = RequestSender(config.engine_url, config.model)
+        request_sender = RequestSender(
+            config.engine_url,
+            config.model,
+            extra_headers=config.extra_headers,
+        )
 
         # 4. Create workload
         workload = create_workload(

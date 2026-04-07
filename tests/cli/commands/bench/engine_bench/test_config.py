@@ -58,6 +58,7 @@ class TestEngineBenchConfig:
             export_csv=True,
             export_json=False,
             quiet=False,
+            extra_headers={},
         )
         defaults.update(overrides)
         return EngineBenchConfig(**defaults)  # type: ignore[arg-type]
