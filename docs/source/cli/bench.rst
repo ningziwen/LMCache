@@ -145,6 +145,12 @@ General Options
    * - ``-q`` / ``--quiet``
      - No
      - Suppress the real-time progress display.
+   * - ``--raw-sse``
+     - No
+     - Use raw HTTP streaming instead of the OpenAI client. Handles
+       mixed SSE formats (``text_completion`` + ``chat.completion.chunk``)
+       in the same response stream. Required for production routers with
+       multi-backend routing that return mixed formats.
 
 
 .. _bench-tokens-per-gb:

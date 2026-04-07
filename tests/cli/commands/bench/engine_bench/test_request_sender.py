@@ -475,3 +475,87 @@ class TestRequestSenderClose:
         await sender.close()
 
         mock_client.close.assert_called_once()
+
+
+# -----------------------------------------------------------------------
+# Raw SSE parsing tests
+# -----------------------------------------------------------------------
+
+
+def _chat_chunk(content: str, usage: dict | None = None) -> str:
+    # Standard
+    import json
+
+    chunk: dict = {"choices": [{"delta": {"content": content}}]}
+    if usage:
+        chunk["usage"] = usage
+    return json.dumps(chunk)
+
+
+def _text_chunk(text: str, usage: dict | None = None) -> str:
+    # Standard
+    import json
+
+    chunk: dict = {"choices": [{"text": text}]}
+    if usage:
+        chunk["usage"] = usage
+    return json.dumps(chunk)
+
+
+class TestRawSSEParsing:
+    def test_parses_chat_completion_format(self) -> None:
+        # Standard
+        import json
+
+        sender = RequestSender("http://localhost:8000", "test-model", raw_sse=True)
+        data = json.loads(_chat_chunk("Hello"))
+        content, usage = sender._extract_from_json(data)
+        assert content == "Hello"
+        assert usage is None
+
+    def test_parses_text_completion_format(self) -> None:
+        # Standard
+        import json
+
+        sender = RequestSender("http://localhost:8000", "test-model", raw_sse=True)
+        data = json.loads(_text_chunk("Hello"))
+        content, usage = sender._extract_from_json(data)
+        assert content == "Hello"
+        assert usage is None
+
+    def test_extract_with_usage(self) -> None:
+        # Standard
+        import json
+
+        sender = RequestSender("http://localhost:8000", "test-model")
+        data = json.loads(_chat_chunk("", {"prompt_tokens": 5, "completion_tokens": 3}))
+        content, usage = sender._extract_from_json(data)
+        assert content == ""
+        assert usage == {"prompt_tokens": 5, "completion_tokens": 3}
+
+    def test_extract_empty_choices(self) -> None:
+        sender = RequestSender("http://localhost:8000", "test-model")
+        content, usage = sender._extract_from_json({"choices": []})
+        assert content == ""
+        assert usage is None
+
+    def test_raw_sse_flag_stored(self) -> None:
+        sender = RequestSender("http://localhost:8000", "test-model", raw_sse=True)
+        assert sender._raw_sse is True
+
+    def test_raw_sse_default_false(self) -> None:
+        sender = RequestSender("http://localhost:8000", "test-model")
+        assert sender._raw_sse is False
+
+
+class TestUTF8Safety:
+    def test_incremental_decoder_handles_split_bytes(self) -> None:
+        # Standard
+        import codecs
+
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        euro_bytes = "€".encode("utf-8")  # 3 bytes: e2 82 ac
+        part1 = euro_bytes[:2]
+        part2 = euro_bytes[2:]
+        result = decoder.decode(part1) + decoder.decode(part2)
+        assert "€" in result
