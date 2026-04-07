@@ -554,4 +554,10 @@ class BenchCommand(BaseCommand):
             round(final.p99_decode_speed, 2),
         )
 
+        itl = metrics.add_section("itl", "Inter-Token Latency")
+        itl.add("mean", "Mean ITL (ms)", round(final.mean_itl_ms, 2))
+        itl.add("p50", "P50 ITL (ms)", round(final.p50_itl_ms, 2))
+        itl.add("p90", "P90 ITL (ms)", round(final.p90_itl_ms, 2))
+        itl.add("p99", "P99 ITL (ms)", round(final.p99_itl_ms, 2))
+
         metrics.emit()
