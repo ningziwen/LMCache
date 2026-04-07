@@ -27,6 +27,7 @@ class RequestResult:
     num_input_tokens: int  # from server usage report
     num_output_tokens: int  # tokens generated
     decode_speed: float  # output tokens / decode time (tok/s)
+    inter_token_latency: float  # average inter-token latency (seconds)
     submit_time: float  # absolute timestamp
     first_token_time: float  # absolute timestamp
     finish_time: float  # absolute timestamp
@@ -223,6 +224,7 @@ class StatsCollector:
             "num_input_tokens",
             "num_output_tokens",
             "decode_speed",
+            "inter_token_latency",
             "submit_time",
             "first_token_time",
             "finish_time",

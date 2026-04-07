@@ -150,6 +150,15 @@ class BenchCommand(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--session-key",
+            default=None,
+            help=(
+                "Header name for session-based routing. When set, each "
+                "concurrent user sends a unique session ID via this header "
+                "(e.g., --session-key x-session-id)."
+            ),
+        )
+        parser.add_argument(
             "--export-config",
             default=None,
             metavar="FILE",
@@ -333,6 +342,7 @@ class BenchCommand(BaseCommand):
                 "quiet",
                 "format",
                 "output",
+                "session_key",
             ):
                 cli_val = getattr(args, attr, None)
                 if cli_val is not None:
@@ -435,7 +445,11 @@ class BenchCommand(BaseCommand):
         )
 
         # 3. Create request sender (callbacks wired after workload creation)
-        request_sender = RequestSender(config.engine_url, config.model)
+        request_sender = RequestSender(
+            config.engine_url,
+            config.model,
+            session_key=config.session_key,
+        )
 
         # 4. Create workload
         workload = create_workload(

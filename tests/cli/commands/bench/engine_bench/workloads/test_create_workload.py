@@ -37,6 +37,7 @@ def _make_config(**overrides) -> EngineBenchConfig:
         export_csv=True,
         export_json=False,
         quiet=False,
+        session_key="",
     )
     defaults.update(overrides)
     return EngineBenchConfig(**defaults)  # type: ignore[arg-type]

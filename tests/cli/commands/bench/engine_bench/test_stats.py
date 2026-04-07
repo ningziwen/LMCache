@@ -30,6 +30,7 @@ def _make_result(
     num_input_tokens: int = 10000,
     num_output_tokens: int = 128,
     decode_speed: float = 48.0,
+    inter_token_latency: float = 0.012,
     error: str = "",
 ) -> RequestResult:
     now = time.time()
@@ -41,6 +42,7 @@ def _make_result(
         num_input_tokens=num_input_tokens,
         num_output_tokens=num_output_tokens,
         decode_speed=decode_speed,
+        inter_token_latency=inter_token_latency,
         submit_time=now,
         first_token_time=now + ttft,
         finish_time=now + request_latency,
@@ -60,6 +62,7 @@ def _make_config() -> EngineBenchConfig:
         export_csv=True,
         export_json=True,
         quiet=False,
+        session_key="",
     )
 
 

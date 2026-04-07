@@ -475,3 +475,22 @@ class TestRequestSenderClose:
         await sender.close()
 
         mock_client.close.assert_called_once()
+
+
+# -----------------------------------------------------------------------
+# Session key tests
+# -----------------------------------------------------------------------
+
+
+class TestSessionKey:
+    def test_session_key_stored(self) -> None:
+        s = RequestSender(
+            "http://localhost:8000",
+            "test-model",
+            session_key="x-session-id",
+        )
+        assert s._session_key == "x-session-id"
+
+    def test_session_key_none_by_default(self) -> None:
+        s = RequestSender("http://localhost:8000", "test-model")
+        assert s._session_key is None

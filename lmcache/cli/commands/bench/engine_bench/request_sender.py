@@ -73,10 +73,12 @@ class RequestSender:
         model: str,
         completions_mode: bool = False,
         on_finished: list[OnFinishedCallback] = [],  # noqa: B006
+        session_key: str | None = None,
     ) -> None:
         self._model = model
         self._completions_mode = completions_mode
         self._on_finished = list(on_finished)
+        self._session_key = session_key
 
         base_url = _normalize_url(engine_url)
         api_key = os.getenv("OPENAI_API_KEY", "")
@@ -101,6 +103,7 @@ class RequestSender:
         request_id: str,
         messages: list[dict[str, str]],
         max_tokens: int = 128,
+        session_id: str | None = None,
     ) -> RequestResult:
         """Send a single streaming request and return the result.
 
@@ -116,7 +119,9 @@ class RequestSender:
         num_output_tokens = 0
 
         try:
-            response = await self._create_stream(messages, max_tokens)
+            response = await self._create_stream(
+                messages, max_tokens, session_id=session_id
+            )
 
             async for chunk in response:
                 # Extract usage from final chunk
@@ -151,6 +156,7 @@ class RequestSender:
                 num_input_tokens=num_input_tokens,
                 num_output_tokens=num_output,
                 decode_speed=decode_speed,
+                inter_token_latency=0.0,
                 submit_time=submit_time,
                 first_token_time=first_token_time,
                 finish_time=finish_time,
@@ -168,6 +174,7 @@ class RequestSender:
                 num_input_tokens=0,
                 num_output_tokens=0,
                 decode_speed=0.0,
+                inter_token_latency=0.0,
                 submit_time=submit_time,
                 first_token_time=0.0,
                 finish_time=finish_time,
@@ -190,12 +197,14 @@ class RequestSender:
         request_id: str,
         messages: list[dict[str, str]],
         max_tokens: int = 1,
+        session_id: str | None = None,
     ) -> RequestResult:
         """Send a warmup request (``max_tokens=1`` by default)."""
         return await self.send_request(
             request_id,
             messages,
             max_tokens=max_tokens,
+            session_id=session_id,
         )
 
     async def close(self) -> None:
@@ -210,8 +219,13 @@ class RequestSender:
         self,
         messages: list[dict[str, str]],
         max_tokens: int,
+        session_id: str | None = None,
     ) -> collections.abc.AsyncIterator:
         """Dispatch the streaming API call (chat or completions)."""
+        extra: dict[str, str] = {}
+        if self._session_key and session_id is not None:
+            extra[self._session_key] = session_id
+
         if self._completions_mode:
             prompt = messages[0]["content"] if messages else ""
             return await self._client.completions.create(
@@ -221,6 +235,7 @@ class RequestSender:
                 max_tokens=max_tokens,
                 temperature=0.0,
                 stream_options={"include_usage": True},
+                extra_headers=extra if extra else None,
             )
         return await self._client.chat.completions.create(
             model=self._model,
@@ -229,4 +244,5 @@ class RequestSender:
             max_tokens=max_tokens,
             temperature=0.0,
             stream_options={"include_usage": True},
+            extra_headers=extra if extra else None,
         )

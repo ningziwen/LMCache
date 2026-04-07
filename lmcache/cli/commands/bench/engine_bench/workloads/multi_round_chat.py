@@ -252,6 +252,7 @@ class MultiRoundChatWorkload(BaseWorkload):
             result = await self._request_sender.send_warmup_request(
                 request_id,
                 messages,
+                session_id=f"session-{session.session_id}",
             )
             if not result.successful:
                 self._progress_monitor.log_message(
@@ -300,7 +301,7 @@ class MultiRoundChatWorkload(BaseWorkload):
         )
 
         task = asyncio.create_task(
-            self._dispatch(request_id, messages),
+            self._dispatch(request_id, messages, session_id=session.session_id),
         )
         self._pending_tasks.add(task)
         task.add_done_callback(self._on_task_done)
@@ -312,12 +313,15 @@ class MultiRoundChatWorkload(BaseWorkload):
         self,
         request_id: str,
         messages: list[dict[str, str]],
+        session_id: int | None = None,
     ) -> None:
         """Send a single benchmark request."""
+        sid = f"session-{session_id}" if session_id is not None else None
         await self._request_sender.send_request(
             request_id,
             messages,
             max_tokens=self._config.output_length,
+            session_id=sid,
         )
 
     def _on_task_done(self, task: asyncio.Task) -> None:

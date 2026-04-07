@@ -145,6 +145,13 @@ General Options
    * - ``-q`` / ``--quiet``
      - No
      - Suppress the real-time progress display.
+   * - ``--session-key HEADER``
+     - No
+     - Header name for session-based routing. When set, each concurrent
+       user sends a unique session ID via this header (e.g.,
+       ``--session-key x-session-id``). Enables session-affinity routing
+       in production routers so returning conversations hit the same
+       backend server, preserving the KV cache.
 
 
 .. _bench-tokens-per-gb:
