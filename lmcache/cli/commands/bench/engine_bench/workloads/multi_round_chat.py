@@ -119,7 +119,33 @@ class Session:
     in_flight: bool = False
 
     def build_messages(self, query: str) -> list[dict[str, str]]:
-        """Construct OpenAI-format messages for a request."""
+        """Construct OpenAI-format messages for a request.
+
+        Automatically truncates old exchanges when the estimated context
+        would exceed the model's max context length (default 16384 tokens).
+        """
+        # Estimate token budget: leave room for output + safety margin
+        max_context_tokens = 14000  # conservative for max_model_len=16384
+        base_tokens = (
+            self._estimate_tokens(self.system_prompt)
+            + self._estimate_tokens(self.history_text)
+            + 20  # assistant ack + overhead
+            + self._estimate_tokens(query)
+        )
+
+        # Trim oldest exchanges if context would exceed limit
+        exchange_tokens = [
+            self._estimate_tokens(q) + self._estimate_tokens(a)
+            for q, a in self.exchanges
+        ]
+        total = base_tokens + sum(exchange_tokens)
+        trimmed_start = 0
+        while total > max_context_tokens and trimmed_start < len(exchange_tokens):
+            total -= exchange_tokens[trimmed_start]
+            trimmed_start += 1
+
+        kept_exchanges = self.exchanges[trimmed_start:]
+
         messages: list[dict[str, str]] = [
             {"role": "system", "content": self.system_prompt},
         ]
@@ -133,11 +159,16 @@ class Session:
                     "content": "Understood, I have read the context above.",
                 },
             )
-        for q, a in self.exchanges:
+        for q, a in kept_exchanges:
             messages.append({"role": "user", "content": q})
             messages.append({"role": "assistant", "content": a})
         messages.append({"role": "user", "content": query})
         return messages
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: ~4 chars per token."""
+        return len(text) // 4 + 1
 
     def record_answer(self, query: str, answer: str) -> None:
         """Record a completed exchange and mark session as ready."""
