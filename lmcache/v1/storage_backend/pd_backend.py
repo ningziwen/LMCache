@@ -199,6 +199,20 @@ class PDBackend(AllocatorBackendInterface):
         self.data: dict[CacheEngineKey, MemoryObj] = {}
         self.data_lock = threading.Lock()
 
+        # Async transfer support: use a dedicated NIXL worker thread with a
+        # queue so the vLLM worker thread is not blocked during KV transfer.
+        # All NIXL GPU operations run on this single thread to avoid CUDA
+        # context contention. This prevents RPC timeouts in vLLM v0.19.0's
+        # multiprocess executor.
+        import queue as queue_mod
+        self._nixl_queue: queue_mod.Queue = queue_mod.Queue()
+        self._nixl_thread = threading.Thread(
+            target=self._nixl_worker_loop,
+            name=f"nixl-worker-tp{metadata.worker_id}",
+            daemon=True,
+        )
+        self._nixl_thread.start()
+
         # Direct registration mode: when True, vLLM's KV cache is registered
         # directly with NIXL instead of using an intermediate pd_buffer.
         self.use_direct_registration = getattr(config, "pd_direct_registration", False)
@@ -543,6 +557,10 @@ class PDBackend(AllocatorBackendInterface):
         """
         Submit batched put tasks to transfer KV caches to peer.
 
+        The NIXL transfer is offloaded to a background thread to avoid blocking
+        the vLLM worker thread (which would cause RPC timeouts in vLLM v0.19.0's
+        multiprocess executor).
+
         :param on_complete_callback: Optional callback invoked once per key
             after the transfer completes. Callback exceptions are caught and logged.
         """
@@ -581,44 +599,86 @@ class PDBackend(AllocatorBackendInterface):
                 mem_objs_to_send.append(mem_obj)
 
         if mem_objs_to_send:
-            # TODO(Jiayi): make this decoupled with transfer channel
             # Construct transfer spec
             channel_transfer_spec = {
                 "receiver_id": receiver_id,
                 "remote_indexes": remote_indexes,
             }
 
-            # TODO(Jiayi): Consider making this real async
-            # Perform the actual transfer
-            self.transfer_channel.batched_write(
-                objects=mem_objs_to_send,
-                transfer_spec=channel_transfer_spec,
-            )
-
-            # TODO(Jiayi): consider moving this to the transfer channel
-            # since we might want the transfer to be async.
-            for mem_obj in mem_objs_to_send:
-                mem_obj.ref_count_down()
+            # Submit to the dedicated NIXL worker thread via queue.
+            # The worker thread handles the blocking batched_write() call.
+            self._nixl_queue.put((
+                "write",
+                mem_objs_to_send,
+                channel_transfer_spec,
+                keys,
+                on_complete_callback,
+                transfer_spec,
+            ))
         else:
             logger.debug(
                 "All memory objects have been already sent to the remote peer."
                 " Skipping transfer."
             )
+            # Still need to notify proxy and call callbacks for already-sent
+            if transfer_spec.is_last_prefill:
+                if self.proxy_side_channel is not None:
+                    notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
+                    notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+                    self.proxy_side_channel.send(notif_msg_bytes)
+            if on_complete_callback is not None:
+                for key in keys:
+                    try:
+                        on_complete_callback(key)
+                    except Exception as e:
+                        logger.warning(
+                            f"on_complete_callback failed for key {key}: {e}"
+                        )
 
-        if transfer_spec.is_last_prefill:
-            # Notify the proxy that the transfer is done
-            if self.proxy_side_channel is not None:
-                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
-                self.proxy_side_channel.send(notif_msg_bytes)
+    def _nixl_worker_loop(self) -> None:
+        """Dedicated NIXL worker thread. Processes transfer requests from queue.
 
-        # Call completion callback for all keys after transfer completes
-        if on_complete_callback is not None:
-            for key in keys:
+        All NIXL GPU operations (batched_write, batched_read) run on this
+        single thread to avoid CUDA context contention with the vLLM worker.
+        """
+        import queue as queue_mod
+        while self.running:
+            try:
+                item = self._nixl_queue.get(timeout=1.0)
+            except queue_mod.Empty:
+                continue
+
+            if item is None:
+                break  # Shutdown signal
+
+            op_type = item[0]
+            if op_type == "write":
+                _, mem_objs, channel_spec, keys, callback, transfer_spec = item
                 try:
-                    on_complete_callback(key)
+                    self.transfer_channel.batched_write(
+                        objects=mem_objs,
+                        transfer_spec=channel_spec,
+                    )
                 except Exception as e:
-                    logger.warning(f"on_complete_callback failed for key {key}: {e}")
+                    logger.error(f"NIXL write failed in worker thread: {e}")
+                finally:
+                    for mem_obj in mem_objs:
+                        mem_obj.ref_count_down()
+
+                if transfer_spec.is_last_prefill:
+                    if self.proxy_side_channel is not None:
+                        notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
+                        notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+                        self.proxy_side_channel.send(notif_msg_bytes)
+
+                if callback is not None:
+                    for key in keys:
+                        try:
+                            callback(key)
+                        except Exception as e:
+                            logger.warning(
+                                f"on_complete_callback failed for key {key}: {e}"
+                            )
 
     ############################################################
     # Prefiller functions end
